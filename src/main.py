@@ -21,8 +21,12 @@ tavily_client = TavilyClient(
 state = {
     "question": "",
     "plan": [],
+    "previous_plan": [],
     "results": [],
-    "answer": ""
+    "answer": "",
+    "approved": False,
+    "reason": "",
+    "retry_count": 0
 }
 
 state["question"] = input("Ask your question (or type exit)")
@@ -30,8 +34,22 @@ state["question"] = input("Ask your question (or type exit)")
 
 def planner(state):
     prompt = f"""
+
+You are a planning agent    
+
 Question:
 {state["question"]}
+
+Previous attempt feedback
+(empty if first run):
+Previous Plan:
+{state["previous_plan"]}
+
+Failure Reason:
+{state["reason"]}
+
+If feedback is provided create a plan that specifically addresses the issues mentioned.
+Do not create the same plan if the feedback indicates missing information, incomplete reason.
 
 Based on the question provided create a step by step plan
 Provide the plan in JSON format
@@ -68,6 +86,8 @@ Generate the plan for the question above.
 """
 
     parsed = json.loads(call_cloud_llm(prompt))
+
+    state["previous_plan"] = state["plan"]
     state["plan"] = parsed["plan"]
 
     return state
@@ -85,12 +105,16 @@ def executor(state):
 
         if tool == "web_search":
             result = web_search(action)
-            state["results"].append(
-                {
-                    "action": action,
-                    "result": result
-                }
-            )
+
+        else:
+            result = call_local_llm(step["action"])
+
+        state["results"].append(
+            {
+                "action": action,
+                "result": result
+            }
+        )
 
     return state
 
@@ -98,13 +122,15 @@ def executor(state):
 def answer(state):
 
     prompt = f"""
-
+You are an analyst
+    
 Question:
 {state["question"]}
 
 Execution Results:
 {state["results"]}
 
+Analyze the results provided.
 Answer the question.
 Provide the answer in bullet points.
 
@@ -112,8 +138,78 @@ Provide the answer in bullet points.
 
     state["answer"] = call_local_llm(prompt)
 
-    print("Final Results: ", state["answer"])
+    return state
 
+
+def reflect(state):
+    prompt = f"""
+
+You are an Evaluating agent.
+Question:
+{state["question"]}
+
+Plan:
+{state["plan"]}
+
+Results:
+{state["results"]}
+
+Answer:
+{state["answer"]}
+
+Determine whether the answer is supported by execution results.
+
+Return JSON only:
+
+Do not explain 
+Do not use markdown.
+Do not use ```json.
+
+Follow the below format
+
+{{
+   "approved":true,
+   "reason":"...."
+
+}}
+
+Follow the below constraints for "approved"
+
+Approved is only:
+
+true
+
+or 
+
+false
+(if there is any chance of improvement)
+
+"""
+    result = call_cloud_llm(prompt)
+    print("Reflect result: ", result)
+    parsed = json.loads(result)
+    state["approved"] = parsed["approved"]
+    state["reason"] = parsed["reason"]
+
+    print("Reason: ", state["reason"])
+
+    return state
+
+
+def reflection_router(state):
+
+    print("Reflect: ", state["approved"])
+
+    if state["approved"]:
+        return "end"
+    elif state["retry_count"] >= 1:
+        return "end"
+    else:
+        state["retry_count"] += 1
+        return "planner"
+
+
+def end(state):
     return state
 
 
@@ -176,6 +272,16 @@ graph_builder.add_node(
     answer
 )
 
+graph_builder.add_node(
+    "reflect",
+    reflect
+)
+
+graph_builder.add_node(
+    "end",
+    end
+)
+
 graph_builder.add_edge(
     "planner",
     "executor"
@@ -186,12 +292,22 @@ graph_builder.add_edge(
     "answer"
 )
 
+graph_builder.add_edge(
+    "answer",
+    "reflect"
+)
+
+graph_builder.add_conditional_edges(
+    "reflect",
+    reflection_router
+)
+
 graph_builder.set_entry_point(
     "planner"
 )
 
 graph_builder.set_finish_point(
-    "answer"
+    "end"
 )
 
 graph = graph_builder.compile()
